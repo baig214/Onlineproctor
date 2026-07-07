@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>ProctorSense — Candidate</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #07070f;
+    color: #e8e8f0;
+    font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+
+  /* The candidate does not see a dashboard. The video element must exist
+     and keep playing (the pipeline reads frames from it / captureProof
+     grabs snapshots from it) but it does not need to be visible. */
+#video {
+  width: 640px;
+  max-width: 100%;
+  aspect-ratio: 4 / 3;
+  border-radius: 12px;
+  border: 2px solid #22c55e;
+  background: #000;
+  transform: scaleX(-1);
+  object-fit: cover;
+}
+
+.status-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 24px;
+}
+
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #505070;
+    display: inline-block;
+    margin-right: 8px;
+  }
+  .status-dot.live { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .status-dot.connecting { background: #f59e0b; }
+  .status-dot.error { background: #ef4444; }
+
+  .status-line {
+    font-size: 14px;
+    color: #9090b0;
+  }
+
+  .status-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #e8e8f0;
+  }
+</style>
+</head>
+<body>
+
+<!-- Minimal "monitoring active" indicator — no dashboard beyond this. -->
+<div class="status-wrap">
+
+    <video
+        id="video"
+        autoplay
+        playsinline
+        muted>
+    </video>
+
+    <div class="status-title">
+        <span class="status-dot connecting" id="status-dot"></span>
+        <span id="status-title-text">Starting monitoring session…</span>
+    </div>
+
+    <div class="status-line" id="status-detail">
+        Requesting camera access…
+    </div>
+
+</div>
+
+<script type="module">
+import { updateSignals, updateGazeSignals, setEyeTracking, updateEyeAlerts, showFaceVisibilityNotice } from './risk-engine.js'
+
+// ─── WebSocket relay connection ─────────────────────────────────────────
+// Configurable relay address. Change this if the relay server runs
+// somewhere other than localhost:8080.
+const RELAY_URL = 'wss://localhost/npserver/'
+
+const RECONNECT_BASE_DELAY_MS = 1000
+const RECONNECT_MAX_DELAY_MS = 15000
+
+let ws = null
+let reconnectAttempt = 0
+let reconnectTimer = null
+let outgoingQueue = [] // buffered messages while socket isn't open
+
+function setStatus(mode, detail) {
+  const dot = document.getElementById('status-dot')
+  const title = document.getElementById('status-title-text')
+  const detailEl = document.getElementById('status-detail')
+  if (dot) dot.className = 'status-dot ' + mode
+  if (title) {
+    title.textContent =
+      mode === 'live' ? 'Monitoring active' :
+      mode === 'error' ? 'Monitoring interrupted' :
+      'Connecting…'
+  }
+  if (detailEl && detail) detailEl.textContent = detail
+}
+
+function connectRelay() {
+  clearTimeout(reconnectTimer)
+  setStatus('connecting', 'Connecting to proctor session…')
+
+  ws = new WebSocket(RELAY_URL)
+
+  ws.addEventListener('open', () => {
+    reconnectAttempt = 0
+    // Identify this connection to the relay per the relay's handshake protocol.
+    ws.send(JSON.stringify({ type: 'hello', role: 'candidate' }))
+    setStatus('live', 'Monitoring active — connected to proctor session')
+    flushQueue()
+  })
+
+  ws.addEventListener('message', (event) => {
+    handleServerMessage(event.data)
+  })
+
+  ws.addEventListener('close', () => {
+    setStatus('connecting', 'Reconnecting to proctor session…')
+    scheduleReconnect()
+  })
+
+  ws.addEventListener('error', () => {
+    setStatus('error', 'Connection error — retrying…')
+    // 'close' will also fire after 'error' for a failed connection attempt,
+    // so reconnect scheduling is left to the close handler to avoid
+    // double-scheduling.
+  })
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer)
+  const delay = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempt))
+  reconnectAttempt++
+  reconnectTimer = setTimeout(connectRelay, delay)
+}
+
+function flushQueue() {
+  if (!outgoingQueue.length) return
+  const pending = outgoingQueue
+  outgoingQueue = []
+  for (const msg of pending) sendRaw(msg)
+}
+
+function sendRaw(obj) {
+  const text = JSON.stringify(obj)
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(text)
+    } catch (err) {
+      // Send failed unexpectedly — requeue so it isn't silently dropped.
+      outgoingQueue.push(obj)
+    }
+  } else {
+    outgoingQueue.push(obj)
+  }
+}
+
+// Exposed for risk-engine.js (and this file) to call instead of touching
+// the DOM. This is the single point every former render call now funnels
+// through — risk-engine.js does `window.sendToProctor({ type, ...payload })`.
+window.sendToProctor = function (obj) {
+    //console.log("➡️ Sending to proctor:", obj)
+  sendRaw(obj)
+}
+
+// ─── Extension point: proctor -> candidate commands ─────────────────────
+// The relay currently only requires candidate -> proctor traffic, but the
+// wire format already supports the reverse direction. Handle whatever the
+// proctor sends here. Two commands are wired up already since the
+// candidate UI buttons that used to trigger them (recalibrate, eye
+// tracking toggle) no longer exist on this page — the proctor is now the
+// only place these can be triggered from.
+function handleServerMessage(raw) {
+  let msg
+  try {
+    msg = JSON.parse(raw)
+  } catch {
+    return
+  }
+
+  if (msg.type === 'recalibrate') {
+    gazeWorker.postMessage({ type: 'recalibrate' })
+    return
+  }
+
+  if (msg.type === 'set_eye_tracking') {
+    setEyeTracking(!!msg.enabled)
+    return
+  }
+
+  // Add further proctor -> candidate command handling here as needed.
+}
+
+connectRelay()
+
+// ─── Capture + compute pipeline (unchanged from index.html) ────────────
+window.setEyeTracking = setEyeTracking
+const worker = new Worker("./worker.js");
+const gazeWorker = new Worker('./gaze-worker.js');
+const proofCanvas = new OffscreenCanvas(320, 240);
+const proofCtx = proofCanvas.getContext('2d');
+
+window.captureProof = function() {
+  proofCtx.drawImage(video, 0, 0, proofCanvas.width, proofCanvas.height)
+  // NOTE: transferToImageBitmap() detaches proofCanvas's backing store, which
+  // breaks every capture after the first since this canvas is shared/reused.
+  // getImageData + putImageData on a throwaway canvas keeps proofCanvas intact
+  // so every signal (person/multi/phone/device/gaze) gets its own real snapshot.
+  const snapshot = new OffscreenCanvas(proofCanvas.width, proofCanvas.height)
+  const snapshotCtx = snapshot.getContext('2d')
+  snapshotCtx.drawImage(proofCanvas, 0, 0)
+  return snapshot.transferToImageBitmap()
+}
+
+const TARGET_CAPTURE_FPS = 8;
+const FRAME_INTERVAL_US  = 1_000_000 / TARGET_CAPTURE_FPS;
+
+function realTime() {
+  return new Date().toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+  })
+}
+window.realTime = realTime
+
+let lastGazeFrameTime = 0
+
+const motionWorker = new Worker('./motion-worker.js')
+
+let lastMotionFrameTime = 0
+const MOTION_SAMPLE_INTERVAL = 5000 // every 5 seconds
+
+// ─── Proof/bitmap -> base64 helper (shared, single conversion path) ────
+// Mirrors the helper in risk-engine.js — used here for motion frames,
+// which carry three bitmaps (before/after/diff) rather than a single
+// "proof" field, so they're converted at the point they're received
+// instead of inside risk-engine.js.
+let _wireCanvas = null
+let _wireCtx = null
+function bitmapToDataURL(bitmap) {
+  if (!bitmap) return null
+  if (!_wireCanvas) {
+    _wireCanvas = document.createElement('canvas')
+    _wireCtx = _wireCanvas.getContext('2d')
+  }
+  _wireCanvas.width = bitmap.width
+  _wireCanvas.height = bitmap.height
+  _wireCtx.drawImage(bitmap, 0, 0)
+  return _wireCanvas.toDataURL('image/jpeg', 0.7)
+}
+
+motionWorker.onmessage = (e) => {
+  const msg = e.data
+  if (msg.type !== 'motion') return
+
+  const data = {
+    motionDetected: msg.motionDetected,
+    motionRatio: msg.motionRatio,
+    changedPx: msg.changedPx,
+    activeZones: msg.activeZones,
+    isFlash: msg.isFlash,
+    flashZones: msg.flashZones,
+    beforeBitmap: bitmapToDataURL(msg.beforeBitmap),
+    afterBitmap: bitmapToDataURL(msg.afterBitmap),
+    diffBitmap: bitmapToDataURL(msg.diffBitmap),
+    id: Date.now()
+  }
+
+  window.sendToProctor({ type: 'motion_event', data })
+
+  // The worker transferred these bitmaps to us; close them once drawn so
+  // their underlying resources are released now that they've been
+  // converted to base64 strings above.
+  msg.beforeBitmap.close()
+  msg.afterBitmap.close()
+  msg.diffBitmap.close()
+}
+
+gazeWorker.onmessage = (e) => {
+  const msg = e.data
+
+  if (msg.type === 'error') {
+    console.error('gaze worker error:', msg.message)
+    return
+  }
+  if (msg.type === 'eyeAlert') {
+    updateEyeAlerts(msg)
+    return
+  }
+
+  if (msg.type !== 'gaze') return
+
+  if (msg.state === 'calibrating') {
+    window.sendToProctor({
+      type: 'calibration_status',
+      calibrating: true,
+      progress: msg.calibrationProgress
+    })
+    return
+  }
+
+  if (!msg.baselineReady) return
+  window.sendToProctor({ type: 'calibration_status', calibrating: false, progress: 100 })
+
+  window._gazeState = msg.state
+  window._gazeScore = msg.score
+
+  //console.log('gaze:', msg.state, 'score:', msg.score, 'deviation:', msg.deviation)
+
+  updateGazeSignals(msg)
+}
+
+worker.onmessage = (e) => {
+  const msg = e.data;
+  if (msg.type === "stats") {
+    return;
+  }
+  if (msg.type === "update") {
+    //console.log('[DEBUG main thread] phoneRawConf:', msg.phoneRawConf, 'full msg keys:', Object.keys(msg))
+    updateSignals(msg.results, msg.phoneRawConf, msg.phoneZone, msg.personZones, msg.rawPersonCount, msg.deviceRawConf, msg.deviceZone, msg.deviceClass, msg.phoneIncident, msg.deviceIncident)
+    if (msg.faceVisibilityIncident) showFaceVisibilityNotice(true, msg.faceVisibilityIncident.reason)
+    else showFaceVisibilityNotice(false)
+    window.sendToProctor({
+      type: 'phone_screen_state',
+      state: msg.phoneScreenState === 'on' ? 'on' : msg.phoneScreenState === 'off' ? 'off' : null
+    })
+    window._lastPersonBox = msg.personBox;
+    window._lastFaceVisible = msg.faceVisible ?? true;
+
+    const now = performance.now()
+    if (now - lastGazeFrameTime >= 100) {
+      lastGazeFrameTime = now
+      const gazeFrame = new VideoFrame(video)
+      gazeWorker.postMessage({ type: 'frame', frame: gazeFrame, timestamp: now, personBox: window._lastPersonBox ?? null, faceVisible: window._lastFaceVisible ?? true }, [gazeFrame])
+    }
+
+    worker.postMessage({
+      type: 'riskLevel',
+      level: window._getRisk() < 30 ? 'low'
+        : window._getRisk() < 60 ? 'medium'
+        : window._getRisk() < 80 ? 'high'
+        : 'critical'
+    });
+  }
+  if (msg.type === "comparison") {
+    //console.log(`${msg.model} | inference: ${msg.inferenceMs}ms | persons: ${msg.personCount} | avg conf: ${msg.avgConfidence} | detected: ${msg.detections.join(', ')}`);
+    return;
+  }
+};
+
+function setStartupStatus(text) {
+  const el = document.getElementById('status-detail')
+  if (el) el.textContent = text
+}
+
+async function start() {
+  setStartupStatus("Requesting camera access…");
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+  } catch (e) {
+    setStatus('error', 'Camera access denied — check permissions and reload')
+    return;
+  }
+
+  setStartupStatus("Starting video stream…");
+  const video = document.getElementById("video");
+  video.srcObject = stream;
+  await video.play();
+
+  setStartupStatus("Calibrating detection models…");
+
+  const [track] = stream.getVideoTracks();
+  const processor = new MediaStreamTrackProcessor({ track });
+  const reader = processor.readable.getReader();
+
+  let lastSentTs = 0;
+
+  async function frameLoop() {
+    while (true) {
+      const { value: frame, done } = await reader.read();
+      if (done) break;
+
+      const ts = frame.timestamp;
+
+      if (ts - lastSentTs < FRAME_INTERVAL_US) {
+        frame.close();
+        continue;
+      }
+
+      lastSentTs = ts;
+
+      const now = Date.now()
+
+      // send to motion worker first (before transferring to main worker)
+      if (now - lastMotionFrameTime > MOTION_SAMPLE_INTERVAL) {
+        lastMotionFrameTime = now
+        try {
+          const motionFrame = new VideoFrame(frame)
+          motionWorker.postMessage({
+            type: 'frame',
+            frame: motionFrame,
+            personBox: window._lastPersonBox
+          }, [motionFrame])
+        } catch(e) {
+          console.warn('motion frame error:', e)
+        }
+      }
+
+      // then transfer original to main worker
+      worker.postMessage(
+        { type: "frame", frame, timestamp: ts },
+        [frame]
+      )
+    }
+  }
+
+  frameLoop();
+}
+
+start().catch(err => {
+  setStatus('error', "Camera error: " + err.message);
+});
+</script>
+</body>
+</html>

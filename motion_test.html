@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Motion Detection Test</title>
+<style>
+  body { font-family: monospace; background: #111; color: #ccc; padding: 2rem; }
+  h1 { font-size: 1rem; color: #fff; margin-bottom: 1.5rem; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+  .col { display: flex; flex-direction: column; gap: 0.4rem; }
+  label { font-size: 0.8rem; color: #888; }
+  input[type=file] { color: #ccc; font-size: 0.85rem; }
+  button { margin-top: 1rem; padding: 0.6rem 1.6rem; background: #2563eb; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+  button:disabled { background: #333; color: #666; cursor: default; }
+  .canvases { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1.5rem; }
+  .canvas-wrap { display: flex; flex-direction: column; gap: 0.4rem; }
+  .canvas-wrap span { font-size: 0.8rem; color: #888; }
+  canvas { max-width: 320px; border: 1px solid #333; border-radius: 4px; }
+  .stats { margin-top: 1rem; background: #1a1a1a; border-radius: 6px; padding: 1rem; font-size: 0.85rem; line-height: 1.8; }
+  .detected { color: #f87171; font-weight: bold; }
+  .clean { color: #4ade80; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Motion Detection Test</h1>
+
+<div class="row">
+  <div class="col">
+    <label>Before image</label>
+    <input type="file" id="imgA" accept="image/*">
+  </div>
+  <div class="col">
+    <label>After image</label>
+    <input type="file" id="imgB" accept="image/*">
+  </div>
+</div>
+
+<button id="runBtn" disabled>Run detection</button>
+
+<div class="canvases">
+  <div class="canvas-wrap"><span>Before</span><canvas id="cBefore"></canvas></div>
+  <div class="canvas-wrap"><span>After</span><canvas id="cAfter"></canvas></div>
+  <div class="canvas-wrap"><span>Diff (red = motion)</span><canvas id="cDiff"></canvas></div>
+  <div class="canvas-wrap"><span>Valid mask</span><canvas id="cMask"></canvas></div>
+</div>
+
+<div class="stats" id="stats" style="display:none"></div>
+
+<script>
+// ─── Constants (same as motion-worker.js) ────────────────────────────────────
+const MIN_BLOB_AREA    = 1500;
+const MIN_MOTION_RATIO = 0.01;
+
+// ─── Pipeline functions (copied verbatim from motion-worker.js) ───────────────
+
+function toGray(rgba, out, n) {
+  for (let i = 0; i < n; i++) {
+    const j = i * 4;
+    out[i] = (rgba[j] * 0.299 + rgba[j+1] * 0.587 + rgba[j+2] * 0.114) | 0;
+  }
+}
+
+function computeFrameDiff(prev, curr, mask, out, n) {
+  for (let i = 0; i < n; i++) {
+    out[i] = (mask[i] === 255 && Math.abs(curr[i] - prev[i]) > 30) ? 255 : 0;
+  }
+}
+
+function erode(src, out, width, height, ksize) {
+  const half = (ksize - 1) >> 1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let min = 255;
+      for (let ky = -half; ky <= half; ky++) {
+        const ny = y + ky;
+        if (ny < 0 || ny >= height) { min = 0; break; }
+        for (let kx = -half; kx <= half; kx++) {
+          const nx = x + kx;
+          if (nx < 0 || nx >= width) { min = 0; break; }
+          if (src[ny * width + nx] === 0) { min = 0; break; }
+        }
+        if (min === 0) break;
+      }
+      out[y * width + x] = min;
+    }
+  }
+}
+
+function dilate(src, out, width, height, ksize) {
+  const half = (ksize - 1) >> 1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let max = 0;
+      outer: for (let ky = -half; ky <= half; ky++) {
+        const ny = y + ky;
+        if (ny < 0 || ny >= height) continue;
+        for (let kx = -half; kx <= half; kx++) {
+          const nx = x + kx;
+          if (nx < 0 || nx >= width) continue;
+          if (src[ny * width + nx] === 255) { max = 255; break outer; }
+        }
+      }
+      out[y * width + x] = max;
+    }
+  }
+}
+
+function filterMotionMask(diff, mask, out, scratch, width, height) {
+  erode(diff, scratch, width, height, 5);
+  dilate(scratch, out, width, height, 5);
+  dilate(out, scratch, width, height, 5);
+  erode(scratch, out, width, height, 5);
+  const n = width * height;
+  for (let i = 0; i < n; i++) {
+    if (mask[i] === 0) out[i] = 0;
+  }
+}
+
+function keepLargeComponents(mask, out, width, height) {
+  out.fill(0);
+  const n = width * height;
+  const labels = new Int32Array(n);
+  let nextLabel = 1;
+  const areas = [];
+  const queue = new Int32Array(n);
+  const dx = [-1, 0, 1, -1, 1, -1, 0, 1];
+  const dy = [-1, -1, -1, 0, 0, 1, 1, 1];
+
+  for (let i = 0; i < n; i++) {
+    if (mask[i] !== 255 || labels[i] !== 0) continue;
+    const label = nextLabel++;
+    areas.push(0);
+    let head = 0, tail = 0;
+    queue[tail++] = i;
+    labels[i] = label;
+    while (head < tail) {
+      const idx = queue[head++];
+      areas[label - 1]++;
+      const cy = (idx / width) | 0;
+      const cx = idx % width;
+      for (let d = 0; d < 8; d++) {
+        const nx = cx + dx[d];
+        const ny = cy + dy[d];
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        const ni = ny * width + nx;
+        if (mask[ni] !== 255 || labels[ni] !== 0) continue;
+        labels[ni] = label;
+        queue[tail++] = ni;
+      }
+    }
+  }
+
+  let changedPixels = 0;
+  for (let i = 0; i < n; i++) {
+    const lbl = labels[i];
+    if (lbl > 0 && areas[lbl - 1] >= MIN_BLOB_AREA) {
+      out[i] = 255;
+      changedPixels++;
+    }
+  }
+  return { changedPixels };
+}
+
+function getActiveZones(mask, width, height) {
+  const rowEdges = [0, height >> 1, height];
+  const colEdges = [0, (width / 3) | 0, ((2 * width) / 3) | 0, width];
+  const rowNames = ['top', 'bottom'];
+  const colNames = ['left', 'center', 'right'];
+  const active = [];
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < 3; c++) {
+      let found = false;
+      outer: for (let y = rowEdges[r]; y < rowEdges[r + 1]; y++) {
+        for (let x = colEdges[c]; x < colEdges[c + 1]; x++) {
+          if (mask[y * width + x] === 255) { found = true; break outer; }
+        }
+      }
+      if (found) active.push(`${rowNames[r]}-${colNames[c]}`);
+    }
+  }
+  return active;
+}
+
+function renderDiff(rgba, mask, width, height) {
+  const out = new Uint8ClampedArray(rgba);
+  const n = width * height;
+  for (let i = 0; i < n; i++) {
+    if (mask[i] !== 255) continue;
+    const j = i * 4;
+    out[j]     = (rgba[j]     * 0.55 + 255 * 0.45) | 0;
+    out[j + 1] = (rgba[j + 1] * 0.55) | 0;
+    out[j + 2] = (rgba[j + 2] * 0.55) | 0;
+  }
+  return new ImageData(out, width, height);
+}
+
+// ─── Image loading helper ─────────────────────────────────────────────────────
+
+function loadImageData(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth;
+      c.height = img.naturalHeight;
+      c.getContext('2d').drawImage(img, 0, 0);
+      resolve(c.getContext('2d').getImageData(0, 0, c.width, c.height));
+      URL.revokeObjectURL(img.src);
+    };
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// ─── UI ───────────────────────────────────────────────────────────────────────
+
+const imgAInput = document.getElementById('imgA');
+const imgBInput = document.getElementById('imgB');
+const runBtn    = document.getElementById('runBtn');
+
+function checkReady() {
+  runBtn.disabled = !(imgAInput.files[0] && imgBInput.files[0]);
+}
+imgAInput.addEventListener('change', checkReady);
+imgBInput.addEventListener('change', checkReady);
+
+runBtn.addEventListener('click', async () => {
+  runBtn.disabled = true;
+  runBtn.textContent = 'Running…';
+
+  const [idA, idB] = await Promise.all([
+    loadImageData(imgAInput.files[0]),
+    loadImageData(imgBInput.files[0]),
+  ]);
+
+  // Resize B to match A if needed
+  let rgbaA = idA.data;
+  let rgbaB = idB.data;
+  const width  = idA.width;
+  const height = idA.height;
+
+  if (idB.width !== width || idB.height !== height) {
+    const c = document.createElement('canvas');
+    c.width = width; c.height = height;
+    const img = new Image();
+    await new Promise(r => {
+      img.onload = r;
+      img.src = URL.createObjectURL(imgBInput.files[0]);
+    });
+    c.getContext('2d').drawImage(img, 0, 0, width, height);
+    rgbaB = c.getContext('2d').getImageData(0, 0, width, height).data;
+  }
+
+  const n = width * height;
+  const candidateMask = new Uint8Array(n).fill(255); // no person box in test
+  const grayA      = new Uint8Array(n);
+  const grayB      = new Uint8Array(n);
+  const diffMask   = new Uint8Array(n);
+  const filtered   = new Uint8Array(n);
+  const scratch    = new Uint8Array(n);
+  const validMask  = new Uint8Array(n);
+
+  toGray(rgbaA, grayA, n);
+  toGray(rgbaB, grayB, n);
+  computeFrameDiff(grayA, grayB, candidateMask, diffMask, n);
+  filterMotionMask(diffMask, candidateMask, filtered, scratch, width, height);
+  const { changedPixels } = keepLargeComponents(filtered, validMask, width, height);
+  const motionRatio  = changedPixels / n;
+  const activeZones  = getActiveZones(validMask, width, height);
+  const motionDetected = changedPixels > MIN_BLOB_AREA && motionRatio > MIN_MOTION_RATIO;
+  const diffImageData  = renderDiff(rgbaB, validMask, width, height);
+
+  // Draw canvases
+  function draw(id, imageData) {
+    const c = document.getElementById(id);
+    c.width = imageData.width; c.height = imageData.height;
+    c.getContext('2d').putImageData(imageData, 0, 0);
+  }
+
+  draw('cBefore', idA);
+  draw('cAfter',  new ImageData(rgbaB instanceof Uint8ClampedArray ? rgbaB : new Uint8ClampedArray(rgbaB.buffer), width, height));
+  draw('cDiff',   diffImageData);
+
+  // Draw valid mask as grayscale
+  const maskRgba = new Uint8ClampedArray(n * 4);
+  for (let i = 0; i < n; i++) {
+    maskRgba[i*4] = maskRgba[i*4+1] = maskRgba[i*4+2] = validMask[i];
+    maskRgba[i*4+3] = 255;
+  }
+  draw('cMask', new ImageData(maskRgba, width, height));
+
+  // Stats
+  const statsEl = document.getElementById('stats');
+  statsEl.style.display = 'block';
+  statsEl.innerHTML = `
+    <div>Motion detected: <span class="${motionDetected ? 'detected' : 'clean'}">${motionDetected ? 'YES' : 'NO'}</span></div>
+    <div>Changed pixels: ${changedPixels.toLocaleString()}</div>
+    <div>Motion ratio: ${(motionRatio * 100).toFixed(2)}%</div>
+    <div>Active zones: ${activeZones.length ? activeZones.join(', ') : 'none'}</div>
+    <div>Frame size: ${width}×${height}</div>
+  `;
+
+  runBtn.disabled = false;
+  runBtn.textContent = 'Run detection';
+});
+</script>
+</body>
+</html>

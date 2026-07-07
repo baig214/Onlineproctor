@@ -1,0 +1,12 @@
+{
+  "name": "proctorsense-relay",
+  "version": "1.0.0",
+  "description": "Minimal 1:1 WebSocket relay between a candidate and proctor browser tab.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
