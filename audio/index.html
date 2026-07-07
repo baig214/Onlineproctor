@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Audio Monitor</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: monospace;
+      max-width: 800px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+    h1 { margin-bottom: 0.25rem; }
+    h2 { margin-top: 1.2rem; margin-bottom: 0.4rem; }
+    p  { margin: 0.2rem 0; }
+
+    .status-row {
+      display: flex;
+      gap: 2rem;
+      align-items: center;
+      margin-top: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    /* ── Camera ── */
+    .camera-container { margin: 1rem 0; }
+    video {
+      width: 100%;
+      max-height: 300px;
+      border: 2px solid #333;
+      border-radius: 8px;
+      background: black;
+      object-fit: cover;
+    }
+    #cameraStatus  { margin-top: 0.5rem; font-weight: bold; }
+    #recordStatus  { margin-top: 0.3rem; color: #555; }
+    #countdown     { font-size: 2rem; font-weight: bold; margin-top: 0.5rem; }
+    #modelStatus   { margin-top: 0.3rem; color: #555; font-size: 0.85rem; }
+
+    /* ── Scores grid ── */
+    #scoresGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 6px 12px;
+      margin-top: 0.6rem;
+    }
+    .score-row { display: flex; flex-direction: column; gap: 2px; }
+    .score-label {
+      font-size: 0.75rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: flex;
+      justify-content: space-between;
+    }
+    .score-label span { color: #888; }
+    .score-track {
+      height: 6px;
+      background: #e8e8e8;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .score-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.1s ease, background 0.1s ease;
+      background: #2a9d8f;
+    }
+    .score-fill.active { background: #e76f51; }
+
+    /* ── Devices panel ── */
+    #devicesPanel {
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      margin-top: 1.2rem;
+      background: #fafafa;
+    }
+    #devicesPanel h2 { margin-top: 0; margin-bottom: 0.5rem; }
+
+    .device-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .device-item {
+      font-size: 0.82rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 5px 8px;
+      border-radius: 4px;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .device-item.active {
+      background: #e8f8f4;
+      border-color: #2a9d8f;
+    }
+
+    /* type badges */
+    .badge {
+      margin-left: auto;
+      font-size: 0.7rem;
+      padding: 1px 6px;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+    .badge-system  { background: #efefef; color: #444; }
+    .badge-bt      { background: #ddeeff; color: #1a4a80; }
+    .badge-ext     { background: #f0e6ff; color: #5a1a80; }
+
+    /* ── Log ── */
+    textarea {
+      width: 100%;
+      font-family: monospace;
+      font-size: 0.85rem;
+      resize: vertical;
+    }
+    button { margin-top: 0.4rem; }
+    #interim {
+      color: gray;
+      font-style: italic;
+      min-height: 1.2em;
+      margin-top: 0.4rem;
+    }
+    #interim.violation {
+      color: #c0392b;
+      font-style: normal;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Live Audio Monitor</h1>
+
+  <div class="status-row">
+    <p>Speech: <strong><span id="speechStatus">starting…</span></strong></p>
+  </div>
+
+  <div id="modelStatus">Model: loading…</div>
+
+  <div class="camera-container">
+    <h2>Camera Feed</h2>
+    <video id="camera" autoplay playsinline muted></video>
+    <p id="cameraStatus">Requesting camera access…</p>
+    <p id="recordStatus">Recorder: waiting…</p>
+    <div id="countdown">–</div>
+  </div>
+
+  <h2>Sound Probabilities (Top 5)</h2>
+  <div id="scoresGrid"></div>
+
+  <p id="interim"></p>
+
+  <!-- ── Device Monitor Panel ─────────────────────────────────────────────── -->
+  <div id="devicesPanel">
+    <h2>🎙 Audio Input Devices</h2>
+    <ul class="device-list" id="micList">
+      <li class="device-item"><span>Waiting for mic access…</span></li>
+    </ul>
+  </div>
+  <!-- ───────────────────────────────────────────────────────────────────────── -->
+
+  <h2>Log</h2>
+  <textarea id="flags" rows="12" readonly
+            placeholder="Speech detection events will appear here with timestamps…"></textarea>
+  <button onclick="document.getElementById('flags').value=''">Clear</button>
+
+  <script type="module">
+    import { AudioClassifier, FilesetResolver }
+      from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@0.10.0/+esm';
+
+    // ── Workers ────────────────────────────────────────────────────────────────
+    const recorderWorker = new Worker('./recorder.worker.js', { type: 'classic' });
+    const devicesWorker  = new Worker('./devices.worker.js',  { type: 'classic' });
+
+    // ── DOM refs ───────────────────────────────────────────────────────────────
+    const speechStatusEl = document.getElementById('speechStatus');
+    const interimEl      = document.getElementById('interim');
+    const flagsEl        = document.getElementById('flags');
+    const cameraEl       = document.getElementById('camera');
+    const cameraStatusEl = document.getElementById('cameraStatus');
+    const recordStatusEl = document.getElementById('recordStatus');
+    const countdownEl    = document.getElementById('countdown');
+    const modelStatusEl  = document.getElementById('modelStatus');
+    const scoresGridEl   = document.getElementById('scoresGrid');
+    const micListEl      = document.getElementById('micList');
+
+    // ── devices.worker → UI ───────────────────────────────────────────────────
+    devicesWorker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === 'log')   console.log('[devices.worker]', msg.message);
+      if (msg.type === 'state') renderDeviceState(msg);
+    };
+
+    const TYPE_META = {
+      bluetooth: { badge: '🔵 BT',        badgeClass: 'badge-bt'     },
+      external:  { badge: '🔌 External',  badgeClass: 'badge-ext'    },
+      system:    { badge: '💻 System',    badgeClass: 'badge-system' },
+    };
+
+    function renderDeviceState({ micDevices, activeMicId }) {
+      micListEl.innerHTML = '';
+      if (!micDevices.length) {
+        micListEl.innerHTML = '<li class="device-item"><span>No microphones found</span></li>';
+        return;
+      }
+      micDevices.forEach(d => {
+        const isActive = d.deviceId === activeMicId;
+        const meta     = TYPE_META[d.micType] || TYPE_META.system;
+        const li       = document.createElement('li');
+        li.className   = 'device-item' + (isActive ? ' active' : '');
+        li.innerHTML   = `
+          <span>${escHtml(d.label)}</span>
+          <span class="badge ${meta.badgeClass}">${meta.badge}</span>
+        `;
+        micListEl.appendChild(li);
+      });
+    }
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // ── Enumerate mics and report to worker ────────────────────────────────────
+    async function enumerateMics() {
+      try {
+        const all = await navigator.mediaDevices.enumerateDevices();
+        devicesWorker.postMessage({
+          type:    'mic-list',
+          devices: all
+            .filter(d => d.kind === 'audioinput')
+            .map(d => ({ deviceId: d.deviceId, label: d.label, groupId: d.groupId })),
+        });
+      } catch (err) {
+        console.warn('enumerateDevices failed:', err);
+      }
+    }
+
+    navigator.mediaDevices.addEventListener('devicechange', enumerateMics);
+
+    // ── Download queue ─────────────────────────────────────────────────────────
+    const dlQueue = [];
+    let   dlBusy  = false;
+
+    function enqueueDownload(buffer, filename, mimeType) {
+      dlQueue.push({ buffer, filename, mimeType });
+      drainQueue();
+    }
+    function drainQueue() {
+      if (dlBusy || dlQueue.length === 0) return;
+      dlBusy = true;
+      const { buffer, filename, mimeType } = dlQueue.shift();
+      const blob = new Blob([buffer], { type: mimeType });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+      setTimeout(() => { dlBusy = false; drainQueue(); }, 500);
+    }
+
+    // ── Recorder worker → UI ───────────────────────────────────────────────────
+    recorderWorker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === 'status') recordStatusEl.textContent = 'Recorder: ' + msg.message;
+      if (msg.type === 'save')   enqueueDownload(msg.buffer, msg.filename, msg.mimeType);
+      if (msg.type === 'extend') extendCurrentWindow();
+    };
+
+    // ── MediaRecorder cycle ────────────────────────────────────────────────────
+    const BASE_S       = 10;
+    const EXT_S        = 10;
+    const TIMESLICE_MS = 1000;
+
+    let globalMimeType = 'video/webm';
+    let globalStream   = null;
+    let currentMR      = null;
+    let currentParts   = [];
+    let baseChunkCount = 0;
+    let secondsLeft    = 0;
+    let tickInterval   = null;
+    let extendPending  = false;
+    let inExtension    = false;
+
+    function clearTick() {
+      if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+    }
+
+    function startCycle() {
+      if (!globalStream) return;
+      extendPending = false; inExtension = false;
+      currentParts = []; baseChunkCount = 0;
+      secondsLeft = BASE_S;
+      countdownEl.textContent = secondsLeft + 's';
+      recorderWorker.postMessage({ type: 'window-start', isExtension: false });
+
+      currentMR = new MediaRecorder(globalStream, { mimeType: globalMimeType });
+      currentMR.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) currentParts.push(ev.data);
+      };
+      currentMR.onstop = async () => {
+        const wasExtended = inExtension;
+        const fullBlob    = new Blob(currentParts, { type: globalMimeType });
+        const fullBuffer  = await fullBlob.arrayBuffer();
+        let baseBuffer    = null;
+        if (wasExtended && baseChunkCount > 0) {
+          const baseBlob = new Blob(currentParts.slice(0, baseChunkCount), { type: globalMimeType });
+          baseBuffer     = await baseBlob.arrayBuffer();
+        }
+        currentParts = [];
+        const transferList = [fullBuffer];
+        if (baseBuffer) transferList.push(baseBuffer);
+        recorderWorker.postMessage(
+          { type: 'cycle-end', buffer: fullBuffer, wasExtended, baseBuffer },
+          transferList,
+        );
+        startCycle();
+      };
+
+      currentMR.start(TIMESLICE_MS);
+      clearTick();
+      tickInterval = setInterval(() => {
+        secondsLeft--;
+        countdownEl.textContent = inExtension ? secondsLeft + 's (ext)' : secondsLeft + 's';
+        if (secondsLeft <= 0) {
+          if (!inExtension && extendPending) {
+            baseChunkCount = currentParts.length;
+            inExtension = true; extendPending = false;
+            secondsLeft = EXT_S;
+            countdownEl.textContent = secondsLeft + 's (ext)';
+            recorderWorker.postMessage({ type: 'window-start', isExtension: true });
+          } else {
+            clearTick();
+            if (currentMR && currentMR.state === 'recording') currentMR.stop();
+          }
+        }
+      }, 1000);
+    }
+
+    function extendCurrentWindow() {
+      if (extendPending || inExtension) return;
+      extendPending = true;
+    }
+
+    // ── YAMNet detection config ────────────────────────────────────────────────
+    const SILENCE_LABELS  = new Set(['Silence', 'White noise', 'Background noise']);
+    const SPEECH_LABELS   = new Set([
+      'Speech', 'Male speech, man speaking', 'Female speech, woman speaking',
+      'Child speech, kid speaking', 'Conversation', 'Narration, monologue', 'Whispering',
+    ]);
+    const SOUND_THRESHOLD            = 0;
+    const SPEECH_VIOLATION_THRESHOLD = 0.70;
+    const SILENCE_MS                 = 1500;
+
+    let silenceTimer = null;
+    let speechActive = false;
+
+    const TOP_N = 5;
+    const fillEls = {};
+    let renderedLabels = [];
+
+    function ensureScoreRow(name) {
+      if (fillEls[name]) return;
+      const safeId = name.replace(/[^a-zA-Z0-9]/g, '_');
+      const row = document.createElement('div');
+      row.className = 'score-row';
+      row.dataset.label = name;
+      row.innerHTML = `
+        <div class="score-label">${name} <span id="pct-${safeId}">0%</span></div>
+        <div class="score-track"><div class="score-fill" id="fill-${safeId}"></div></div>`;
+      scoresGridEl.appendChild(row);
+      fillEls[name] = {
+        fill: row.querySelector(`#fill-${safeId}`),
+        pct:  row.querySelector(`#pct-${safeId}`),
+        row,
+      };
+    }
+
+    function updateScores(categories) {
+      const activeNames = new Set(categories.map(c => c.categoryName));
+      for (const name of renderedLabels) {
+        if (!activeNames.has(name) && fillEls[name]) fillEls[name].row.style.display = 'none';
+      }
+      renderedLabels = [];
+      categories.forEach(({ categoryName, score }) => {
+        ensureScoreRow(categoryName);
+        const pct = Math.min(100, Math.round(score * 100));
+        const els = fillEls[categoryName];
+        els.row.style.display = '';
+        els.fill.style.width  = pct + '%';
+        els.pct.textContent   = pct + '%';
+        const isActive = pct > Math.round(SOUND_THRESHOLD * 100) && !SILENCE_LABELS.has(categoryName);
+        els.fill.classList.toggle('active', isActive);
+        renderedLabels.push(categoryName);
+      });
+    }
+
+    function ts() {
+      return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    let violationActive = false;
+    let violationTimer  = null;
+
+    function onViolation(speechScore, categoryName) {
+      const pct = Math.round(speechScore * 100);
+      speechStatusEl.textContent = '🚨 Speech violation!';
+      interimEl.textContent      = `🚨 "${categoryName}" at ${pct}% — VIOLATION`;
+      interimEl.classList.add('violation');
+
+      if (!violationActive) {
+        violationActive = true;
+        const timestamp = ts();
+        const text      = `⚠ VIOLATION — "${categoryName}" at ${pct}%`;
+        flagsEl.value  += (flagsEl.value ? '\n' : '') + `[${timestamp}] ${text}`;
+        flagsEl.scrollTop = flagsEl.scrollHeight;
+        recorderWorker.postMessage({ type: 'speech-detected', timestamp, text, isViolation: true });
+      }
+
+      clearTimeout(violationTimer);
+      violationTimer = setTimeout(() => {
+        violationActive = false;
+        speechStatusEl.textContent = 'Listening…';
+        interimEl.textContent      = '';
+        interimEl.classList.remove('violation');
+      }, SILENCE_MS);
+    }
+
+    function onSoundDetected() {
+      if (!speechActive) {
+        speechActive = true;
+        speechStatusEl.textContent = 'Sound active…';
+      }
+      interimEl.textContent = '🎙 Sound detected…';
+      interimEl.classList.remove('violation');
+
+      clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        silenceTimer = null;
+        speechActive = false;
+        interimEl.textContent = '';
+        speechStatusEl.textContent = 'Listening…';
+      }, SILENCE_MS);
+    }
+
+    // ── Boot ───────────────────────────────────────────────────────────────────
+    (async () => {
+      try {
+        modelStatusEl.textContent = 'Model: loading YAMNet via MediaPipe…';
+
+        const audioFileset = await FilesetResolver.forAudioTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-audio@0.10.0/wasm',
+        );
+
+        const audioClassifier = await AudioClassifier.createFromOptions(audioFileset, {
+          baseOptions: {
+            modelAssetPath:
+              'https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/1/yamnet.tflite',
+          },
+          maxResults: TOP_N,
+        });
+
+        modelStatusEl.textContent = `Model: YAMNet ready ✅ — top ${TOP_N} classes shown`;
+
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+        } catch (err) {
+          speechStatusEl.textContent = '⚠ Permission denied: ' + err.message;
+          cameraStatusEl.textContent = '⚠ Camera unavailable: ' + err.message;
+          return;
+        }
+
+        globalMimeType     = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+          ? 'video/webm;codecs=vp9,opus' : 'video/webm';
+        globalStream       = stream;
+        cameraEl.srcObject = stream;
+        cameraStatusEl.textContent = '✅ Camera connected';
+
+        recorderWorker.postMessage({ type: 'init', mimeType: globalMimeType });
+        speechStatusEl.textContent = 'Listening…';
+
+        // Report active mic deviceId to devices worker
+        const micTrack = stream.getAudioTracks()[0];
+        if (micTrack) {
+          const settings = micTrack.getSettings();
+          devicesWorker.postMessage({
+            type:     'mic-active',
+            deviceId: settings.deviceId || '',
+          });
+        }
+
+        // Enumerate all audio-input devices (labels available after getUserMedia)
+        await enumerateMics();
+
+        startCycle();
+
+        // YAMNet audio pipeline
+        const micStream = new MediaStream([micTrack]);
+        const audioCtx  = new AudioContext({ sampleRate: 16000 });
+        const source    = audioCtx.createMediaStreamSource(micStream);
+
+        const BUFFER_SIZE = 16384;
+        // eslint-disable-next-line deprecation/deprecation
+        const scriptNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+        scriptNode.onaudioprocess = (event) => {
+          const inputData = event.inputBuffer.getChannelData(0);
+
+          let sumOfSquares = 0;
+          for (let i = 0; i < inputData.length; i++) sumOfSquares += inputData[i] * inputData[i];
+          const rms = Math.sqrt(sumOfSquares / inputData.length);
+          const dB  = 20 * Math.log10(rms + 1e-9);
+          console.log(`[MIC] RMS: ${rms.toFixed(4)}  dB: ${dB.toFixed(1)} dBFS`);
+
+          let result;
+          try { result = audioClassifier.classify(inputData, audioCtx.sampleRate); }
+          catch (err) { return; }
+
+          if (!result || !result[0]) return;
+
+          const categories = result[0].classifications[0].categories;
+          updateScores(categories);
+
+          let topSpeechScore = 0;
+          let topSpeechLabel = '';
+          for (const c of categories) {
+            if (SPEECH_LABELS.has(c.categoryName) && c.score > topSpeechScore) {
+              topSpeechScore = c.score;
+              topSpeechLabel = c.categoryName;
+            }
+          }
+
+          if (topSpeechScore >= SPEECH_VIOLATION_THRESHOLD) {
+            onViolation(topSpeechScore, topSpeechLabel);
+          } else {
+            const hasSoundEvent = categories.some(
+              c => !SILENCE_LABELS.has(c.categoryName) && c.score >= SOUND_THRESHOLD,
+            );
+            if (hasSoundEvent) onSoundDetected();
+          }
+        };
+
+        source.connect(scriptNode);
+        const gainNode = audioCtx.createGain();
+        gainNode.gain.value = 0;
+        scriptNode.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+
+      } catch (err) {
+        modelStatusEl.textContent = '⚠ Model error: ' + err.message;
+        console.error(err);
+      }
+    })();
+  </script>
+
+</body>
+</html>
+
+<!-- FunASR vLLM -->
